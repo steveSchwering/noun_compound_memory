@@ -1,0 +1,199 @@
+---
+title: "SRS_exp2_analysis"
+author: "--"
+date: "12/9/2020"
+output: html_document
+---
+
+# Reading in and formatting data
+
+Reading in data from a wide-formatted .csv
+
+```{r}
+data_file = 'srs_exp2_data_formatted.csv'
+
+d_wide = read.csv(data_file, na.strings = c("", "NA"), encoding = "ASCII")
+```
+
+The following participants are to be excluded from analyses given various constraints:
+
+Present: 59, 97, 158
+Missing: 104, 166
+* 166 -- program error
+* 158 -- inaudible
+* 104 -- program error
+* 97 -- participant indicated room was too warm and it was hard to concentrate
+* 59 -- computer froze
+
+```{r}
+p_exclude = c(166, 158, 104, 97, 59)
+
+d = d_wide %>%
+  filter(!part_num %in% p_exclude)
+
+length(unique(d$part_num)) # Working with 154 participants
+
+rm(d_wide)
+```
+
+We also need to do some general cleaning...
+
+```{r}
+d = d %>%
+  filter(!grepl("Practice", trial_num)) %>%
+    # Factorize variables for sorting
+    mutate(part_num = as.factor(part_num),
+           condition = as.numeric(condition)) # The numbers are off due to factorization
+```
+
+And then transform the dataframe to track one word per row:
+
+```{r}
+part_id_columns = c('part_num', 'trial_num', 'condition', 'score_art')
+
+# Format the presented data
+d_pres = d %>%
+  select(c(part_id_columns, c('p_1', 'p_2', 'p_3', 'p_4', 'p_5', 'p_6'))) %>% 
+  mutate_at(vars(starts_with("p_")), funs(as.character)) %>%
+  melt(id.var = c(part_id_columns), variable.name = 'position', value.name = "word") %>%
+  mutate(position = recode(position, 'p_1' = 1, 'p_2' = 2, 'p_3' = 3, 'p_4' = 4, 'p_5' = 5, 'p_6' = 6))
+
+# Format the recall data
+d_recall = d %>%
+  select(c(part_id_columns, c('r_1', 'r_2', 'r_3', 'r_4', 'r_5', 'r_6'))) %>% 
+  mutate_at(vars(starts_with("r_")), funs(as.character)) %>%
+  melt(id.var = c(part_id_columns), variable.name = 'position', value.name = "word") %>%
+  mutate(position = recode(position, 'r_1' = 1, 'r_2' = 2, 'r_3' = 3, 'r_4' = 4, 'r_5' = 5, 'r_6' = 6))
+
+# Combine the data
+d_long = d_pres %>%
+  # Combine and refactor
+  full_join(d_recall, by = c(part_id_columns, 'position')) %>%
+  rename(presented = word.x) %>%
+  rename(recalled = word.y) %>%
+  mutate(recalled = ifelse(!is.na(recalled), recalled, 'NONE'),
+         accuracy = ifelse(presented == recalled, 1, 0),
+         accuracy_f = factor(accuracy, levels = c(0, 1), labels = c('Forgotten', 'Recalled')),
+         condition_f = factor(condition, levels = c(-0.5, 0.5), labels = c('Inconsistent', 'Consistent'))) %>%
+  # Code ART scores
+  mutate(c_art = score_art - mean(score_art)) %>%
+  mutate(group_art = as.factor(ifelse(c_art > mean(c_art), 'High ART', 'Low ART')))
+
+# Subset the dataframe to only include words in positions 3 and 4
+d_long_crit = d_long %>%
+  filter(position %in% c(3, 4)) %>%
+  mutate(position = recode(position, "3" = -0.5, "4" = 0.5))
+```
+
+# Demographics
+
+```{r}
+demo = d %>%
+  select(c(part_num, age, gender)) %>%
+  unique() %>% distinct(part_num, .keep_all = TRUE)
+
+demo %>%
+  summarise(m_age = mean(age),
+            sd_age = sd(age))
+
+demo %>%
+  mutate(gender = recode(gender, 'f' = 'Female', 'F' = 'Female', 'm' = 'Male', 'M' = 'Male')) %>%
+  count(gender)
+  
+```
+
+# Basic descriptive statistics
+
+Looking at over recall by position and condition split by ART (high/low)
+
+Split across positions (681 x 550)
+
+```{r}
+d_long %>%
+  mutate(condition_f = str_to_title(condition_f)) %>%
+  ggplot(aes(x = position, 
+             y = accuracy, 
+             color = condition_f,
+             linetype = group_art,
+             group = interaction(condition_f, group_art))) +
+  stat_summary(geom = 'point', alpha = 0.75, size = 1.5) +
+  stat_summary(geom = 'line', alpha = 0.75, size = 1.5) +
+  stat_summary(fun.data = mean_cl_boot, geom = 'errorbar', alpha = 0.5, width = .25) +
+  scale_x_discrete(limits = c(1, 2, 3, 4, 5, 6)) +
+  scale_y_continuous(limits = c(0.0, 1.0), expand = c(0, 0)) +
+  labs(x = "List position", 
+       y = "Proportion correct", 
+       color = "List condition",
+       linetype = "ART score") +
+  scale_colour_branded(target = "Atomic tangerine", direction = 1) +
+  theme(plot.background = element_rect(fill = 'white', colour = 'white')) +
+  theme(panel.background = element_rect(fill = 'white', colour = 'white'))
+```
+
+```{r}
+d_long_crit %>%
+  group_by(condition, position) %>%
+  summarise(m = mean(accuracy),
+            sd = sd(accuracy))
+```
+
+# Modeling performance
+
+We have much the same structure as Experiment 1, but now we are also considering participant ART score as an additional predictor. We have the same fixed and random effects as before with some additional factors. In particular, we are including centered ART score as both a main effect and as an interaction with condition. Centered ART score is also included as a by-item random slope
+
+The full model is fit below, though you will see there are singular fit issues. The model is commented out to knit the R Markdown file in a reasonable amount of time, but it can be commented and run as usual if you would like.
+
+```{r}
+# Effects of condition, position, ART score, as well as interactions of condition:position and condition:ART analyzed with bobyqa optimizer
+# All random effects
+# Result: Singularity problems!
+m_ART_bq = glmer(accuracy ~ 1 + condition + position + c_art + condition:position + condition:c_art + 
+                   (1 + condition + position + condition:position|part_num) + 
+                   (1 + condition + c_art + condition:c_art|presented), 
+                 data = d_long_crit, 
+                 family = binomial, 
+                 control = glmerControl(optCtrl=list(maxfun=5e5), 
+                                        optimizer = 'bobyqa'))
+summary(m_ART_bq)
+rePCA(m_ART_bq) # Provides further information on source of singularity 
+```
+
+It appears there is a problem with condition:c_t_art by-item random slope (which makes sense -- there are likely very few cells there). There also appears to be a problem with the condition:position by-participant random slope (which there are more cells of, though we found this difficult to fit in Experiment 1, as well). 
+
+Just excluding just the condition:c_art random by-item slope or just the condition:position by-participant random slope also results in singularity of fit problems.
+
+```{r}
+m_ART_reinter_part_rm = glmer(accuracy ~ 1 + condition + position + c_t_art + condition:position + condition:c_t_art + 
+                                (1 + condition + position|part_num) + 
+                                (1 + condition + c_t_art + condition:c_t_art|presented), 
+                              data = d_long_crit, 
+                              family = binomial, 
+                              control = glmerControl(optCtrl=list(maxfun=5e5), optimizer = 'bobyqa'))
+summary(m_ART_reinter_part_rm)
+rePCA(m_ART_reinter_part_rm)
+
+m_ART_reinter_item_rm = glmer(accuracy ~ 1 + condition + position + c_art + condition:position + condition:c_art + 
+                                (1 + condition + position + condition:position|part_num) + 
+                                (1 + condition + c_art|presented), 
+                              data = d_long_crit, 
+                              family = binomial, 
+                              control = glmerControl(optCtrl=list(maxfun=5e5), optimizer = 'bobyqa'))
+summary(m_ART_reinter_item_rm)
+rePCA(m_ART_reinter_item_rm)
+
+# So, it looks like both higher order effects would need to be removed
+```
+
+I ran a few additional models not included in this final script. Eventually, we find this model fits without any issues. It excludes the highest random slopes.
+
+```{r}
+m_ART_reinter_rm = glmer(accuracy ~ 1 + condition + position + c_art + condition:position + condition:c_art + 
+                           (1 + condition + position|part_num) + 
+                           (1 + condition + c_art|presented), 
+                         data = d_long_crit, 
+                         family = binomial, 
+                         control = glmerControl(optCtrl=list(maxfun=5e5), 
+                                                optimizer = 'bobyqa'))
+summary(m_ART_reinter_rm)
+Anova(m_ART_reinter_rm, type = 3)
+```

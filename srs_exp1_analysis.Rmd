@@ -1,0 +1,394 @@
+---
+title: "srs_exp1_analysis"
+author: "--"
+date: "6/2/2020"
+output: pdf_document
+---
+
+```{r}
+library(tidyverse)
+library(lme4)
+library(PRROC)
+```
+
+```{r}
+setwd(dirname(rstudioapi::getActiveDocumentContext()$path))
+d_wide = read.csv("srs_exp1_data_formatted.csv", na.strings = c("", "NA"), encoding = "ASCII")
+```
+
+## Reading in the data
+
+There are a total of 108 participants in this data set. You may have some initial questions about the structure of the data. I make a note of any oddities here for sake of research transparency as well as my own edification. Why are some participant numbers missing? Research assistants skipped four numbers for participants: 137 (data was copied from participant 135), 138, 154, 186. This was due to the way in which experiments were started on our computers, and occurred because participants would sign up but not attend their research slot.
+
+The data are formatted to be in a tidy, long style. Unfortunately, my script for saving participant data was written when I had less programming and statistics experience, so the format was not as neat as I would have liked. The following script should fix that.
+
+```{r}
+# I personally find this easier to transform  using separate dataframes
+part_id_columns = c('part_num', 'trial_num', 'condition')
+
+# Partition presented words
+d_pres = d_wide %>%
+  select(c(part_id_columns, c('p_1', 'p_2', 'p_3', 'p_4', 'p_5', 'p_6'))) %>% 
+  mutate_at(vars(starts_with("p_")), as.character) %>%
+  melt(id.var = c(part_id_columns), variable.name = 'position', value.name = "word") %>%
+  mutate(position = recode(position, 'p_1' = 1, 'p_2' = 2, 'p_3' = 3, 'p_4' = 4, 'p_5' = 5, 'p_6' = 6))
+
+# Partition recalled words
+d_recall = d_wide %>%
+  select(c(part_id_columns, c('r_1', 'r_2', 'r_3', 'r_4', 'r_5', 'r_6'))) %>% 
+  mutate_at(vars(starts_with("r_")), as.character) %>%
+  melt(id.var = c(part_id_columns), variable.name = 'position', value.name = "word") %>%
+  mutate(position = recode(position, 'r_1' = 1, 'r_2' = 2, 'r_3' = 3, 'r_4' = 4, 'r_5' = 5, 'r_6' = 6))
+
+# Combined presented and recalled rows by participant number, trial number, condition, and position
+d_long = d_pres %>%
+  full_join(d_recall, by = c(part_id_columns, 'position')) %>%
+  rename(presented = word.x,
+         recalled = word.y) %>%
+  mutate(recalled = ifelse(!is.na(recalled), recalled, 'NONE'),
+         accuracy = ifelse(presented == recalled, 1, 0),
+         accuracy_f = factor(accuracy, levels = c(0, 1), labels = c('Forgotten', 'Recalled')),
+         condition_f = factor(condition, levels = c(-0.5, 0.5), labels = c('Inconsistent', 'Consistent'))) %>%
+  mutate_at(c('part_num'), as.factor)
+
+# Clean
+rm(d_pres); rm(d_recall); rm(part_id_columns); rm(d_wide)
+```
+
+We should now see that the data frame is nice and clean. You may also note that our data are scored strictly, both in the sense that accuracy is marked as 1 if the participant recalled the word in the correct position and that the accuracy is marked as 1 only if the recalled word *exactly* matches the presented word. Change of a word to a plural, etc. does not count as an accurate response.
+
+```{r}
+sample_n(d_long, size = 10)
+```
+
+Our analyses concern the recall of the words that occur in positions 3 and 4. Therefore, we are going to filter our dataset down to these two critical positions. Some of the following figures plot recall across all positions, so we retain the other dataframe for those purposes.
+
+```{r}
+d_long_crit = d_long %>%
+  filter(position %in% c(3, 4)) %>%
+  mutate(position = recode(position, "3" = -0.5, "4" = 0.5))
+```
+
+We should check the numbers in our conditions, etc. to make sure that the manipulations did not cause any missing data. If we pass these tests, we should have the same *n* in all rows.
+
+```{r}
+# Checking number of conditions and positions
+d_count_cond = d_long %>%
+  group_by(part_num, condition) %>%
+  count()
+d_count_pos = d_long %>%
+  group_by(part_num, position) %>%
+  count()
+d_count_pos_cond = d_long %>%
+  group_by(part_num, condition, position) %>%
+  count()
+
+# Tallies should be same in each cell
+# Feel free to check them yourself. I won't print them in the .Rmd
+
+rm(d_count_cond); rm(d_count_pos); rm(d_count_pos_cond)
+```
+
+## Exploration of stimuli
+
+We would also like to look at the qualities of the stimuli used for this experiment. Here, we look at the head nouns and noun modifiers that were selected based upon their usage in the Corpus of Contemporary American English.
+
+```{r}
+d_probs = read.csv('srs_exp1_stimuli.csv')
+
+hns = d_probs %>%
+  select(c('experiment', 
+           'pair_num', 
+           'typical_head_noun', 
+           'freq_head_noun', 
+           'prob_head_noun')) %>%
+  rename(word = typical_head_noun,
+         freq_target = freq_head_noun,
+         prob_target_in_role = prob_head_noun) %>%
+  mutate(role = 'Typical head noun',
+         word = as.character(word))
+
+nms = d_probs %>%
+  select(c('experiment', 
+           'pair_num', 
+           'typical_noun_modifier', 
+           'freq_noun_modifier', 
+           'prob_noun_modifier')) %>%
+  rename(word = typical_noun_modifier,
+         freq_target = freq_noun_modifier,
+         prob_target_in_role = prob_noun_modifier) %>%
+  mutate(role = 'Typical noun modifier',
+         word = as.character(word))
+
+stim_recombined = bind_rows(hns, nms)
+```
+
+```{r}
+ggplot(stim_recombined, aes(x = prob_target_in_role, fill = role)) + 
+  geom_histogram(bins = 40, alpha = .5) +
+  scale_y_continuous(name = "Frequency") + 
+  scale_x_continuous(name = "Probability in grammatical role", limits = c(0.3, 1.0)) +
+  theme(axis.text = element_text(size = 14, face = "bold"), 
+        axis.title = element_text(size = 14, face = "bold"),
+        legend.title = element_blank(),
+        legend.position = c(.3, .7),
+        plot.title = element_text(hjust = 0.0)) +
+  labs(title = "Histogram of words in grammatical role",
+       subtitle = 'Experiment 1')
+
+rm(hns); rm(nms); rm(stim_recombined); rm(d_probs)
+```
+
+## Exploration of behavioral data and descriptive statistics
+
+How did participants perform, overall, in this task? Average performance is estimated as a function of position and condition through stat_summary(). Bars represents standard error taking into account by-participant variance.
+
+First, we will just look at positions 3 and 4
+
+Split across positions (681 x 550)
+
+```{r}
+d_long %>%
+  mutate(condition_f = str_to_title(condition_f)) %>%
+  ggplot(aes(x = position, y = accuracy, color = condition_f, group = condition_f)) +
+  stat_summary(geom = 'point', alpha = 0.75, size = 1.5) +
+  stat_summary(geom = 'line', alpha = 0.75, size = 1.5) +
+  stat_summary(fun.data = mean_cl_boot, geom = 'errorbar', alpha = 0.5, width = .25) +
+  scale_x_discrete(limits = c(1, 2, 3, 4, 5, 6)) +
+  scale_y_continuous(limits = c(0.0, 1.0), expand = c(0, 0)) +
+  labs(x = "List position", 
+       y = "Proportion correct", 
+       color = "List condition",
+       linetype = "ART score") +
+  scale_colour_branded(target = "Atomic tangerine", direction = 1) +
+  theme(plot.background = element_rect(fill = 'white', colour = 'white')) +
+  theme(panel.background = element_rect(fill = 'white', colour = 'white'))
+```
+
+We should add some color to this data visualization by examining how performance differs by participant.
+
+```{r}
+d_long_participant = d_long %>%
+  group_by(part_num, position) %>%
+  summarise(m_accuracy = mean(accuracy), 
+            sd = sd(accuracy),
+            se = se(accuracy))
+
+head(d_long_participant, size = 5)
+
+d_long_participant %>%
+  ggplot(aes(x = position, 
+             y = m_accuracy, 
+             color = part_num, 
+             group = part_num)) +
+  geom_point() +
+  geom_line() +
+  theme(legend.position = "none")
+
+rm(d_long_participant)
+```
+
+We can see that there is a lot of variability in how participants perform on this task. Some perform relatively well. Others do not perform nearly as well. Just about every participant exhibits some form of primacy effect. Recency effects are much weaker, and there is a catastrophic decline in performance by position 5. We see a weak trend for a recency effect in position 6, but it is incredibly noisy. We have very poor performance in positions 5 and 6, overall.
+
+It's clear that the performance differences between participants are concealing some of the differences that we are interested in. In the plot above, that is the difference in recall by position, but we will also be interested in the effect of condition (Consistent, Inconsistent) on performance, so we we should account for participant variance. In the following, we control for participant variance in line with the perspectives of Loftus & Masson (1994). Keep in mind there are some problems with this method (see e.g. Franz & Loftus, 2012).
+
+According to Loftus & Masson (1994), we can create within-subjects confidence intervals by factoring out between-subjects variance.
+
+```{r}
+participant_means = d_long %>%
+  mutate(overall_accuracy = mean(accuracy)) %>%
+  group_by(part_num) %>%
+  mutate(participant_accuracy = mean(accuracy)) %>%
+  ungroup() %>%
+  group_by(part_num, position) %>%
+  mutate(participant_pos_accuracy = mean(accuracy)) %>%
+  ungroup() %>%
+  select(c(part_num, 
+           condition, 
+           position, 
+           overall_accuracy, participant_accuracy, participant_pos_accuracy)) %>%
+  mutate(accuracy_norm = 1 +
+           participant_pos_accuracy - 
+           participant_accuracy - 
+           overall_accuracy)
+
+participant_means %>%
+  ggplot(aes(x = position, 
+             y = accuracy_norm, 
+             group = part_num, 
+             color = part_num)) + 
+  geom_point() +
+  geom_line() +
+  theme(legend.position = "none")
+
+rm(participant_means)
+```
+
+Note in the accuracy norm I added 1 to scale the recall by standard measures. This was not a part of Loftus & Masson (1994). However, we can see that participants are all clustering around the same region of the plot. We still have a lot of differences between participants.
+
+Either way, mixed effects modeling should account for this participant variance.
+
+## Condition means
+
+```{r}
+d_long_crit %>%
+  group_by(condition, position) %>%
+  summarise(m = mean(accuracy),
+            sd = sd(accuracy))
+```
+
+## Modeling
+
+We are interested in the recall of items at positions 3 and 4. Our outcome variable is the a binary variable, in which participants have a score of 1 if they recall a word correctly and a score of 0 if they recall a word incorrectly. We also have repeated measures: each participant completed multiple trials, and each item was presented to multiple participants. To that end, we will be employing generalized linear mixed effects regression with a binomial function to analyze this data.
+
+*Fixed effects*:
+* condition -- we expect participants to recall more words in the consistent condition (0.5) better than words in the inconsistent condition (-0.5)
+* position -- we expect participants to recall more words in position 3 (-0.5) better than words in position 4 (0.5)
+* condition:position -- we do not expect the effect of condition to change by position, but it would be interesting if it did. This would mean that the effect of grammatical context affects different words differently. Perhaps NMs would be supported more by compound context because they are unusual (and therefore supported more strongly by the compound context than HNs that can occur in many different contexts), or perhaps HNs would be supported more by compound context because they are more common (and therefore less differentiable from other words).
+
+*Random effects*:
+* by-participant random intercept: Each participant is sampled multiple times
+* by-participant random slope for condition: Each participant sees conditions many times
+* by-participant random slope for position: Each participant sees each position multiple times
+* by-participant random slope for condition:position
+* by-item random intercept: Each item is sampled multiple times
+* by-item random slope for condition: Each item appears in each condition multiple times
+* by-item random slope for position: *NOT* included because this overalps with condition
+
+Trying to fit this complex model leads to convergence errors, as you can see by running the commented code below. For that reason, I followed the guidance of Brauer & Curtin (2017) to achieve convergence while minimizing an increase in error rates.
+
+Note the final model excludes some higher order random effects that likely inflate error rates. These are left out largely due to singular fit issues. If I understand it correctly, this is because we are getting estimates of 0 for the parameter, which means it's not really useful to account for this random effect. The following commented-out blocks of code show some of the models that were attempted to be fit prior to finding the model that did converge.
+
+```{r}
+#m = glmer(accuracy ~ position + condition + position:condition + (1 + position + condition + position:condition|part_num) + (1 + condition|presented), data = d_long_crit, family = binomial, control = glmerControl(optCtrl = list(maxfun = 10000000)))
+#summary(m)
+#rePCA(m)
+```
+
+Model selection process to achieve convergence following Brauer & Curtin (2017):
+* All predictors are already centered
+* The number of iterations were sufficient
+* Predictors and outcome were scaled appropriately
+* There were no covariates, so random effects for covariates could not be removed
+* Lower order by-participant random slopes were removed (step 14)
+
+However, there are also problems of singular fit...
+
+The following is a model with lower order random slope for participants removed; Nelder Mead optimization function used. Again, this model fails to converge with singular fit issues
+
+```{r}
+#m_nm_relower_rm = glmer(accuracy ~ condition + position + condition:position + (1 + condition:position|part_num) + (1 + condition|presented), data = d_long_crit, family = binomial, control = glmerControl(optCtrl = list(maxfun = 5e5), optimizer = 'Nelder_Mead'))
+#summary(m_nm_relower_rm)
+```
+
+Another model was fit with lower order random slopes for participant removed; bobyqa optimization function used. Again, this resulted in another warning about singular fit!
+
+```{r}
+#m_bq_relower_rm = glmer(accuracy ~ condition + position + condition:position + (1 + condition:position|part_num) + (1 + condition|presented), data = d_long_crit, family = binomial, control = glmerControl(optCtrl=list(maxfun=5e5), optimizer = "bobyqa"))
+#summary(m_bq_relower_rm)
+#rePCA(m_bq_relower_rm)
+```
+
+The following model removes the higher order random slope of the interaction while also removing some lower order random slopes. The results seem reasonable given basic looks at the data before. There is no warning about singular fit, and there is a main effect of position and condition with no interaction.
+
+```{r}
+#m_bq_relower_reinter_rm = glmer(accuracy ~ condition + position + condition:position + (1|part_num) + (1 + condition|presented), data = d_long_crit, family = binomial, control = glmerControl(optCtrl=list(maxfun=5e5), optimizer = "bobyqa"))
+#summary(m_bq_relower_reinter_rm)
+#Anova(m_bq_lo_re_rm, type = 3)
+```
+
+However, I found this to be problematic. I think this is too severe of a cut on the random slopes, so I tried a model with some of the lower order random slopes re-introduced while removing the higher order slope.
+
+The following converges fine and results are interpretable. There is a main effect of position and condition with no interaction; no warning about singular fit. *This is the model that is reported in the paper.*
+
+```{r}
+m_bq_reinter_rm = glmer(accuracy ~ condition + position + condition:position + 
+                          (1 + condition + position|part_num) + 
+                          (1 + condition|presented), 
+                        data = d_long_crit, 
+                        family = binomial, 
+                        control = glmerControl(optCtrl = list(maxfun=5e5),
+                                               optimizer = 'bobyqa'))
+summary(m_bq_reinter_rm)
+Anova(m_bq_reinter_rm, type = 3)
+```
+
+## Basic analyses of model performance
+
+Let's take a moment to look at this model more closely to better understand how it operates. We are going to examine the ROC of the model and also take a look at the residuals.
+
+```{r}
+# Same model as above predicting factor -- useful for some analyses
+m_bq_reinter_rm_f = glmer(accuracy_f ~ condition + position + condition:position + 
+                            (1 + condition + position|part_num) + 
+                            (1 + condition|presented), 
+                          data = d_long_crit, 
+                          family = binomial, 
+                          control = glmerControl(optCtrl = list(maxfun=5e5),
+                                                 optimizer = 'bobyqa'))
+summary(m_bq_reinter_rm_f)
+Anova(m_bq_reinter_rm_f, type = 3)
+```
+
+We can then use this model to look at the model predictions and examine how well we are able to discriminate between different cases.
+
+```{r}
+d_long_crit$pred = predict(m_bq_reinter_rm_f, d_long_crit, type = "response")
+d_long_crit$pred_f = factor(as.numeric(predict(m_bq_reinter_rm_f, d_long_crit, type = "response") > 0.5), 
+                            levels = c(0, 1), 
+                            labels = c('Forgotten', 'Recalled'))
+confusionMatrix(data = d_long_crit$pred_f, reference = d_long_crit$accuracy_f, positive = "Recalled")
+```
+
+Accuracy:       .70
+Sensitivity:    .79
+Specificity:    .57
+Pos pred value: .70
+Neg pred value: .69
+Kappa:          .37
+
+Sensitivity is our ability to detect a word being recalled recall when a participant recalls. Sensitivity is high when our model can correctly identify a word being recalled given that it is recalled. The decent sensitivity indicates the model is attuned to detect when words are recalled and does not miss.
+
+Specificity is our ability to detect a recall when a participant recalls. Specificity is high when our model correctly identifies a word being forgotten given that it is forgotten. Low specificity indicates the model cannot correctly detect when a word will be forgotten and incorrectly says too many words will be recalled.
+
+PPV is high when the model correctly classifies recalled words and does not false alarm very much. The decent PPV indicates the model, when it does make a prediction of 'Recalled', is likely to be correct
+
+NPV is high when the model correctly classifies missed words and does not miss very much. The decent/low NPV indicates the model, when it does make a prediction of 'Missed', is somewhat like to be correct
+
+Kappa is high when the model's predictions are better than chance -- when the model just uses base rate. This kappa is OK.
+
+We can also visualize the ROC curve of this model to visualize represent the ability of the model to discriminate cases.
+
+```{r}
+# Visualize the model predictions
+ggplot(data = d_long_crit, aes(x = pred)) + 
+  geom_histogram() +
+  facet_wrap(~accuracy_f) +
+  xlab('Model prediction of probability of correct recall') +
+  ylab('Count')
+
+roc = roc.curve(scores.class0 = d_long_crit$pred, weights.class0 = d_long_crit$accuracy, curve = TRUE)
+plot(roc, xlab = " FPR (1 - Specificity)", ylab = "TPR (Sensitivity)")
+# So, not too great, but it's definitely better than chance
+```
+
+Finally, let's take a look at some of the model residuals.
+
+```{r}
+d_long_crit$resid = d_long_crit$pred - d_long_crit$accuracy
+hist(d_long_crit$resid)
+
+arm::binnedplot(fitted(m_bq_reinter_rm_f), 
+                residuals(m_bq_reinter_rm_f, type = "response"), 
+                nclass = NULL, 
+                xlab = "Expected Values", 
+                ylab = "Average residual", 
+                main = "Binned residual plot", 
+                cex.pts = 0.8, 
+                col.pts = 1, 
+                col.int = "gray")
+```
+
+Gray lines here represent +- 2 SE bands. Most observations fall within these lines, but there is a little more error than we would like. This is probably due to the high amount of variance in responses within participants and items. Controlling the stimuli better would be critical for future experiments, as would more experimental control over participant experience with the stimuli. 
+
+A note on how the binned plots work: The binned plot averages together residuals from bins. The average error should fall within a confidence interval. It's not entirely clear to me that these averaged residuals are 'normal', but the majority of them fall within the confidence interval. It probably is slightly above .95 we would expect. As mentioned before, the spread and the values beyond the gray lines are probably calling out for more predictors.
